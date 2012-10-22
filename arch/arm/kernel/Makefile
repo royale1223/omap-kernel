@@ -68,6 +68,8 @@ obj-$(CONFIG_HW_PERF_EVENTS)	+= perf_event.o
 AFLAGS_iwmmxt.o			:= -Wa,-mcpu=iwmmxt
 obj-$(CONFIG_ARM_CPU_TOPOLOGY)  += topology.o
 
+obj-$(CONFIG_BOOTINFO)		+= bootinfo.o
+
 ifneq ($(CONFIG_ARCH_EBSA110),y)
   obj-y		+= io.o
 endif
