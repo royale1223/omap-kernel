@@ -29,6 +29,8 @@
 #include <linux/fs.h>
 #include <linux/proc_fs.h>
 #include <linux/memblock.h>
+#include <linux/bug.h>
+#include <linux/compiler.h>
 
 #include <asm/unified.h>
 #include <asm/cpu.h>
@@ -42,6 +44,7 @@
 #include <asm/cacheflush.h>
 #include <asm/cachetype.h>
 #include <asm/tlbflush.h>
+#include <asm/system.h>
 
 #include <asm/prom.h>
 #include <asm/mach/arch.h>
@@ -114,6 +117,13 @@ struct cpu_cache_fns cpu_cache __read_mostly;
 struct outer_cache_fns outer_cache __read_mostly;
 EXPORT_SYMBOL(outer_cache);
 #endif
+
+/*
+ * Cached cpu_architecture() result for use by assembler code.
+ * C code should use the cpu_architecture() function instead of accessing this
+ * variable directly.
+ */
+int __cpu_architecture __read_mostly = CPU_ARCH_UNKNOWN;
 
 struct stack {
 	u32 irq[3];
@@ -210,7 +220,7 @@ static const char *proc_arch[] = {
 	"?(17)",
 };
 
-int cpu_architecture(void)
+static int __get_cpu_architecture(void)
 {
 	int cpu_arch;
 
@@ -241,6 +251,13 @@ int cpu_architecture(void)
 		cpu_arch = CPU_ARCH_UNKNOWN;
 
 	return cpu_arch;
+}
+
+int __pure cpu_architecture(void)
+{
+	BUG_ON(__cpu_architecture == CPU_ARCH_UNKNOWN);
+
+	return __cpu_architecture;
 }
 
 static int cpu_has_aliasing_icache(unsigned int arch)
@@ -280,18 +297,19 @@ static void __init cacheid_init(void)
 	if (arch >= CPU_ARCH_ARMv6) {
 		if ((cachetype & (7 << 29)) == 4 << 29) {
 			/* ARMv7 register format */
+			arch = CPU_ARCH_ARMv7;
 			cacheid = CACHEID_VIPT_NONALIASING;
 			if ((cachetype & (3 << 14)) == 1 << 14)
 				cacheid |= CACHEID_ASID_TAGGED;
-			else if (cpu_has_aliasing_icache(CPU_ARCH_ARMv7))
-				cacheid |= CACHEID_VIPT_I_ALIASING;
-		} else if (cachetype & (1 << 23)) {
-			cacheid = CACHEID_VIPT_ALIASING;
 		} else {
-			cacheid = CACHEID_VIPT_NONALIASING;
-			if (cpu_has_aliasing_icache(CPU_ARCH_ARMv6))
-				cacheid |= CACHEID_VIPT_I_ALIASING;
+			arch = CPU_ARCH_ARMv6;
+			if (cachetype & (1 << 23))
+				cacheid = CACHEID_VIPT_ALIASING;
+			else
+				cacheid = CACHEID_VIPT_NONALIASING;
 		}
+		if (cpu_has_aliasing_icache(arch))
+			cacheid |= CACHEID_VIPT_I_ALIASING;
 	} else {
 		cacheid = CACHEID_VIVT;
 	}
@@ -343,54 +361,6 @@ static void __init feat_v6_fixup(void)
 		elf_hwcap &= ~HWCAP_TLS;
 }
 
-static void __init setup_processor(void)
-{
-	struct proc_info_list *list;
-
-	/*
-	 * locate processor in the list of supported processor
-	 * types.  The linker builds this table for us from the
-	 * entries in arch/arm/mm/proc-*.S
-	 */
-	list = lookup_processor_type(read_cpuid_id());
-	if (!list) {
-		printk("CPU configuration botched (ID %08x), unable "
-		       "to continue.\n", read_cpuid_id());
-		while (1);
-	}
-
-	cpu_name = list->cpu_name;
-
-#ifdef MULTI_CPU
-	processor = *list->proc;
-#endif
-#ifdef MULTI_TLB
-	cpu_tlb = *list->tlb;
-#endif
-#ifdef MULTI_USER
-	cpu_user = *list->user;
-#endif
-#ifdef MULTI_CACHE
-	cpu_cache = *list->cache;
-#endif
-
-	printk("CPU: %s [%08x] revision %d (ARMv%s), cr=%08lx\n",
-	       cpu_name, read_cpuid_id(), read_cpuid_id() & 15,
-	       proc_arch[cpu_architecture()], cr_alignment);
-
-	sprintf(init_utsname()->machine, "%s%c", list->arch_name, ENDIANNESS);
-	sprintf(elf_platform, "%s%c", list->elf_name, ENDIANNESS);
-	elf_hwcap = list->elf_hwcap;
-#ifndef CONFIG_ARM_THUMB
-	elf_hwcap &= ~HWCAP_THUMB;
-#endif
-
-	feat_v6_fixup();
-
-	cacheid_init();
-	cpu_proc_init();
-}
-
 /*
  * cpu_init - initialise one CPU.
  *
@@ -405,6 +375,8 @@ void cpu_init(void)
 		printk(KERN_CRIT "CPU%u: bad primary CPU number\n", cpu);
 		BUG();
 	}
+
+	cpu_proc_init();
 
 	/*
 	 * Define the placement constraint for the inline asm directive below.
@@ -440,6 +412,55 @@ void cpu_init(void)
 	      "I" (offsetof(struct stack, und[0])),
 	      PLC (PSR_F_BIT | PSR_I_BIT | SVC_MODE)
 	    : "r14");
+}
+
+static void __init setup_processor(void)
+{
+	struct proc_info_list *list;
+
+	/*
+	 * locate processor in the list of supported processor
+	 * types.  The linker builds this table for us from the
+	 * entries in arch/arm/mm/proc-*.S
+	 */
+	list = lookup_processor_type(read_cpuid_id());
+	if (!list) {
+		printk("CPU configuration botched (ID %08x), unable "
+		       "to continue.\n", read_cpuid_id());
+		while (1);
+	}
+
+	cpu_name = list->cpu_name;
+	__cpu_architecture = __get_cpu_architecture();
+
+#ifdef MULTI_CPU
+	processor = *list->proc;
+#endif
+#ifdef MULTI_TLB
+	cpu_tlb = *list->tlb;
+#endif
+#ifdef MULTI_USER
+	cpu_user = *list->user;
+#endif
+#ifdef MULTI_CACHE
+	cpu_cache = *list->cache;
+#endif
+
+	printk("CPU: %s [%08x] revision %d (ARMv%s), cr=%08lx\n",
+	       cpu_name, read_cpuid_id(), read_cpuid_id() & 15,
+	       proc_arch[cpu_architecture()], cr_alignment);
+
+	sprintf(init_utsname()->machine, "%s%c", list->arch_name, ENDIANNESS);
+	sprintf(elf_platform, "%s%c", list->elf_name, ENDIANNESS);
+	elf_hwcap = list->elf_hwcap;
+#ifndef CONFIG_ARM_THUMB
+	elf_hwcap &= ~HWCAP_THUMB;
+#endif
+
+	feat_v6_fixup();
+
+	cacheid_init();
+	cpu_init();
 }
 
 void __init dump_machine_table(void)
@@ -915,9 +936,14 @@ void __init setup_arch(char **cmdline_p)
 #endif
 	reserve_crashkernel();
 
-	cpu_init();
 	tcm_init();
 
+#ifdef CONFIG_ZONE_DMA
+	if (mdesc->dma_zone_size) {
+		extern unsigned long arm_dma_zone_size;
+		arm_dma_zone_size = mdesc->dma_zone_size;
+	}
+#endif
 #ifdef CONFIG_MULTI_IRQ_HANDLER
 	handle_arch_irq = mdesc->handle_irq;
 #endif
@@ -979,6 +1005,10 @@ static const char *hwcap_str[] = {
 	"neon",
 	"vfpv3",
 	"vfpv3d16",
+	"tls",
+	"vfpv4",
+	"idiva",
+	"idivt",
 	NULL
 };
 
